@@ -368,7 +368,8 @@ def apply_excel_formatting(worksheet, df):
     # 1. Calculate and set column widths
     for i, col in enumerate(df.columns):
         # Find the max length of the data in the column, or 0 if empty
-        max_data_len = df[col].astype(str).map(len).max() if not df.empty else 0
+        # max_data_len = df[col].astype(str).map(len).max() if not df.empty else 0
+        max_data_len = df[col].astype(str).str.len().max() if not df.empty else 0
         header_len = len(str(col))
         
         # Determine the final width (+4 for some breathing room)
