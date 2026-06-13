@@ -6,6 +6,9 @@ Streamlit app for processing and visualizing school registration form responses.
 import io
 import pandas as pd
 import streamlit as st
+from openpyxl.styles import Border, Side, Alignment
+from openpyxl.utils import get_column_letter
+from streamlit_gsheets import GSheetsConnection
 
 # ─────────────────────────────────────────────
 #  COLUMN MAPPING
@@ -163,12 +166,20 @@ def family_display_name(row):
 # ─────────────────────────────────────────────
 #  CORE DATA PROCESSING
 # ─────────────────────────────────────────────
-def load_and_process(uploaded_file):
+def load_and_process(data_input, is_live_sheet=False):
     try:
-        raw = pd.read_excel(uploaded_file)
+        if is_live_sheet:
+            raw = data_input.copy() # It's already a pandas DataFrame
+        else:
+            raw = pd.read_excel(data_input) # It's an uploaded file
     except Exception as e:
-        st.error(f"❌ خطأ في قراءة الملف: {e}")
+        st.error(f"❌ خطأ في قراءة البيانات: {e}")
         return None, None, None, None, None
+    # try:
+    #     raw = pd.read_excel(uploaded_file)
+    # except Exception as e:
+    #     st.error(f"❌ خطأ في قراءة الملف: {e}")
+    #     return None, None, None, None, None
 
     missing = [v for v in COL.values() if v not in raw.columns]
     if missing:
@@ -282,7 +293,8 @@ def load_and_process(uploaded_file):
             "صف الابن الأكبر":  oldest[1] or "—",
             "الحلقة":            cycle,
             "عدد الأبناء":       len(children_valid),
-            "أسماء الأبناء":    "، ".join([n for n, _ in children_valid]) or "—",
+            # "أسماء الأبناء":    "، ".join([n for n, _ in children_valid]) or "—",
+            "أسماء الأبناء":    "، ".join([f"{n} ({g})" for n, g in children_valid]) or "—",
             "ملاحظات":           row.get(COL["notes"], ""),
             "سبب عدم التسجيل":  row.get(COL["no_reg_reason"], ""),
             "_children":         children_valid,
@@ -342,61 +354,147 @@ def load_and_process(uploaded_file):
 # ─────────────────────────────────────────────
 #  EXPORT HELPERS
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  EXPORT HELPERS
+# ─────────────────────────────────────────────
+def apply_excel_formatting(worksheet, df):
+    """Applies borders, auto-width, and RTL layout to a worksheet."""
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+    align_center_right = Alignment(horizontal='right', vertical='center', wrap_text=True)
+
+    # 1. Calculate and set column widths
+    for i, col in enumerate(df.columns):
+        # Find the max length of the data in the column, or 0 if empty
+        max_data_len = df[col].astype(str).map(len).max() if not df.empty else 0
+        header_len = len(str(col))
+        
+        # Determine the final width (+4 for some breathing room)
+        # Cap at 60 so super long notes don't make the column insanely wide
+        final_width = min(max(max_data_len, header_len) + 4, 60) 
+        
+        col_letter = get_column_letter(i + 1)
+        worksheet.column_dimensions[col_letter].width = final_width
+
+    # 2. Apply borders and alignment to every cell
+    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+        for cell in row:
+            cell.border = thin_border
+            cell.alignment = align_center_right
+
+    # 3. Make the sheet open natively as Right-to-Left
+    worksheet.sheet_view.rightToLeft = True
+
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     export_cols = [c for c in df.columns if not str(c).startswith("_")]
-    df[export_cols].to_excel(buf, index=False)
+    df_clean = df[export_cols]
+    
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_clean.to_excel(writer, index=False, sheet_name="البيانات")
+        apply_excel_formatting(writer.sheets["البيانات"], df_clean)
+        
     return buf.getvalue()
 
 
 def stats_to_excel_bytes(stats: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pd.DataFrame({
+        
+        # Sheet 1: Summary
+        df_summary = pd.DataFrame({
             "البند": [
-                "إجمالي النماذج المستلمة",
-                "النماذج المكررة المحذوفة",
-                "الأسر الفريدة",
-                "الأسر الراغبة في التسجيل",
-                "الأسر الغير راغبة في التسجيل",
-                "نسبة الراغبين (%)",
-                "نسبة الغير راغبين (%)",
-                "إجمالي الأطفال (بصف محدد)",
-                "الطلاب الراغبون في التسجيل",
-                "طلاب بدون صف (مستثنون)",
+                "إجمالي النماذج المستلمة", "النماذج المكررة المحذوفة", "الأسر الفريدة",
+                "الأسر الراغبة في التسجيل", "الأسر الغير راغبة في التسجيل",
+                "نسبة الراغبين (%)", "نسبة الغير راغبين (%)",
+                "إجمالي الأطفال (بصف محدد)", "الطلاب الراغبون في التسجيل", "طلاب بدون صف (مستثنون)",
             ],
             "القيمة": [
-                stats["total_submissions"],
-                stats["duplicates_removed"],
-                stats["total_unique_families"],
-                stats["families_want_yes"],
-                stats["families_want_no"],
-                round(stats["pct_yes"], 1),
-                round(stats["pct_no"], 1),
-                stats["total_children"],
-                stats["total_students_wanting_reg"],
-                stats["gradeless_count"],
+                stats["total_submissions"], stats["duplicates_removed"], stats["total_unique_families"],
+                stats["families_want_yes"], stats["families_want_no"],
+                round(stats["pct_yes"], 1), round(stats["pct_no"], 1),
+                stats["total_children"], stats["total_students_wanting_reg"], stats["gradeless_count"],
             ],
-        }).to_excel(writer, sheet_name="ملخص", index=False)
+        })
+        df_summary.to_excel(writer, sheet_name="ملخص", index=False)
+        apply_excel_formatting(writer.sheets["ملخص"], df_summary)
 
-        grade_df = pd.DataFrame(
-            list(stats["grade_breakdown"].items()), columns=["الصف", "عدد الأطفال"]
-        )
-        grade_df["القسم / Section"] = grade_df["الصف"].map(get_category)
-        grade_df["_ord"] = grade_df["الصف"].map(lambda g: GRADE_RANK.get(g, 999))
-        grade_df.sort_values("_ord").drop(columns="_ord").to_excel(
-            writer, sheet_name="توزيع الصفوف", index=False
-        )
+        # Sheet 2: Grades
+        df_grades = pd.DataFrame(list(stats["grade_breakdown"].items()), columns=["الصف", "عدد الأطفال"])
+        df_grades["القسم / Section"] = df_grades["الصف"].map(get_category)
+        df_grades["_ord"] = df_grades["الصف"].map(lambda g: GRADE_RANK.get(g, 999))
+        df_grades = df_grades.sort_values("_ord").drop(columns="_ord")
+        df_grades.to_excel(writer, sheet_name="توزيع الصفوف", index=False)
+        apply_excel_formatting(writer.sheets["توزيع الصفوف"], df_grades)
 
-        pd.DataFrame(
-            list(stats["cat_breakdown"].items()), columns=["الفئة", "عدد الأطفال"]
-        ).to_excel(writer, sheet_name="توزيع الفئات", index=False)
+        # Sheet 3: Categories
+        df_cats = pd.DataFrame(list(stats["cat_breakdown"].items()), columns=["الفئة", "عدد الأطفال"])
+        df_cats.to_excel(writer, sheet_name="توزيع الفئات", index=False)
+        apply_excel_formatting(writer.sheets["توزيع الفئات"], df_cats)
 
-        pd.DataFrame(
-            list(stats["cycle_breakdown"].items()), columns=["الحلقة", "عدد الأسر"]
-        ).to_excel(writer, sheet_name="توزيع الحلقات", index=False)
+        # Sheet 4: Cycles
+        df_cycles = pd.DataFrame(list(stats["cycle_breakdown"].items()), columns=["الحلقة", "عدد الأسر"])
+        df_cycles.to_excel(writer, sheet_name="توزيع الحلقات", index=False)
+        apply_excel_formatting(writer.sheets["توزيع الحلقات"], df_cycles)
 
     return buf.getvalue()
+# def to_excel_bytes(df: pd.DataFrame) -> bytes:
+#     buf = io.BytesIO()
+#     export_cols = [c for c in df.columns if not str(c).startswith("_")]
+#     df[export_cols].to_excel(buf, index=False)
+#     return buf.getvalue()
+
+
+# def stats_to_excel_bytes(stats: dict) -> bytes:
+#     buf = io.BytesIO()
+#     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+#         pd.DataFrame({
+#             "البند": [
+#                 "إجمالي النماذج المستلمة",
+#                 "النماذج المكررة المحذوفة",
+#                 "الأسر الفريدة",
+#                 "الأسر الراغبة في التسجيل",
+#                 "الأسر الغير راغبة في التسجيل",
+#                 "نسبة الراغبين (%)",
+#                 "نسبة الغير راغبين (%)",
+#                 "إجمالي الأطفال (بصف محدد)",
+#                 "الطلاب الراغبون في التسجيل",
+#                 "طلاب بدون صف (مستثنون)",
+#             ],
+#             "القيمة": [
+#                 stats["total_submissions"],
+#                 stats["duplicates_removed"],
+#                 stats["total_unique_families"],
+#                 stats["families_want_yes"],
+#                 stats["families_want_no"],
+#                 round(stats["pct_yes"], 1),
+#                 round(stats["pct_no"], 1),
+#                 stats["total_children"],
+#                 stats["total_students_wanting_reg"],
+#                 stats["gradeless_count"],
+#             ],
+#         }).to_excel(writer, sheet_name="ملخص", index=False)
+
+#         grade_df = pd.DataFrame(
+#             list(stats["grade_breakdown"].items()), columns=["الصف", "عدد الأطفال"]
+#         )
+#         grade_df["القسم / Section"] = grade_df["الصف"].map(get_category)
+#         grade_df["_ord"] = grade_df["الصف"].map(lambda g: GRADE_RANK.get(g, 999))
+#         grade_df.sort_values("_ord").drop(columns="_ord").to_excel(
+#             writer, sheet_name="توزيع الصفوف", index=False
+#         )
+
+#         pd.DataFrame(
+#             list(stats["cat_breakdown"].items()), columns=["الفئة", "عدد الأطفال"]
+#         ).to_excel(writer, sheet_name="توزيع الفئات", index=False)
+
+#         pd.DataFrame(
+#             list(stats["cycle_breakdown"].items()), columns=["الحلقة", "عدد الأسر"]
+#         ).to_excel(writer, sheet_name="توزيع الحلقات", index=False)
+
+#     return buf.getvalue()
 
 
 # ─────────────────────────────────────────────
@@ -413,6 +511,20 @@ st.markdown("""
 <style>
 body, .stApp { direction: rtl; }
 .stDataFrame { direction: rtl; }
+            
+section[data-testid="stSidebar"][aria-expanded="false"] {
+    min-width: 0px !important;
+    width: 0px !important;
+    opacity: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    transform: translateX(100%) !important; /* Gently moves it off-screen without altering margins */
+}
+
+[data-testid="collapsedControl"] {
+    z-index: 99999 !important;
+}
+            
 .metric-card {
     background: #eef2ff;
     border-radius: 12px;
@@ -456,30 +568,74 @@ st.title("🏫 لوحة تسجيل الطلاب – ثانويّة رحاب ال
 st.markdown("---")
 
 with st.sidebar:
-    st.header("📂 رفع الملف")
-    uploaded = st.file_uploader("ارفع ملف Excel (نموذج الاستجابات)", type=["xlsx", "xls"])
+    st.header("⚙️ مصدر البيانات")
+    
+    # Give yourself a toggle
+    data_source = st.radio(
+        "اختر طريقة جلب البيانات:",
+        ["جلب مباشر من Google Sheets 🌐", "رفع ملف Excel 📂"]
+    )
+    
     st.markdown("---")
-    st.info("💡 ارفع نسخة جديدة في أي وقت وسيتم إعادة الحساب تلقائياً.")
+    
+    uploaded_file = None
+    live_df = None
+    
+    if "Google Sheets" in data_source:
+        sheet_url = st.text_input("رابط Google Sheet", placeholder="الصق الرابط هنا...")
+        if sheet_url:
+            try:
+                # Connect to Google Sheets and read the data
+                conn = st.connection("gsheets", type=GSheetsConnection)
+                # ttl=60 means it caches the data for 60 seconds so it doesn't overload the API
+                live_df = conn.read(spreadsheet=sheet_url, ttl=60)
+                st.success("✅ تم جلب البيانات المباشرة بنجاح!")
+            except Exception as e:
+                st.error(f"فشل في الاتصال بـ Google Sheets: {e}")
+                st.stop()
+        else:
+            st.info("👈 الرجاء إدخال رابط Google Sheet الخاص بالاستجابات.")
+            st.stop()
+            
+    else:
+        uploaded_file = st.file_uploader("ارفع ملف Excel (نموذج الاستجابات)", type=["xlsx", "xls"])
+        if uploaded_file is None:
+            st.info("👈 الرجاء رفع ملف Excel للبدء.")
+            st.stop()
 
-if uploaded is None:
-    st.info("👈 الرجاء رفع ملف Excel من الشريط الجانبي للبدء.")
+# Decide what to pass into your processing function
+if "Google Sheets" in data_source and live_df is not None:
+    raw_df, df_families, stats, df_duplicates, df_gradeless = load_and_process(live_df, is_live_sheet=True)
+elif uploaded_file is not None:
+    raw_df, df_families, stats, df_duplicates, df_gradeless = load_and_process(uploaded_file, is_live_sheet=False)
+else:
     st.stop()
 
-raw_df, df_families, stats, df_duplicates, df_gradeless = load_and_process(uploaded)
-if df_families is None:
-    st.stop()
+# with st.sidebar:
+#     st.header("📂 رفع الملف")
+#     uploaded = st.file_uploader("ارفع ملف Excel (نموذج الاستجابات)", type=["xlsx", "xls"])
+#     st.markdown("---")
+#     st.info("💡 ارفع نسخة جديدة في أي وقت وسيتم إعادة الحساب تلقائياً.")
 
-# ── Alert banners ──────────────────────────────────────────────────────────
-if stats["duplicates_removed"] > 0:
-    st.warning(
-        f"⚠️ تم اكتشاف **{stats['duplicates_removed']}** نموذج مكرر وحُذف. "
-        f"راجع تبويب **تقرير المكررات** للتفاصيل."
-    )
-if stats["gradeless_count"] > 0:
-    st.warning(
-        f"⚠️ تم استثناء **{stats['gradeless_count']}** طالب لعدم تحديد صفهم. "
-        f"راجع تبويب **طلاب بدون صف** للتفاصيل."
-    )
+# if uploaded is None:
+#     st.info("👈 الرجاء رفع ملف Excel من الشريط الجانبي للبدء.")
+#     st.stop()
+
+# raw_df, df_families, stats, df_duplicates, df_gradeless = load_and_process(uploaded)
+# if df_families is None:
+#     st.stop()
+
+# # ── Alert banners ──────────────────────────────────────────────────────────
+# if stats["duplicates_removed"] > 0:
+#     st.warning(
+#         f"⚠️ تم اكتشاف **{stats['duplicates_removed']}** نموذج مكرر وحُذف. "
+#         f"راجع تبويب **تقرير المكررات** للتفاصيل."
+#     )
+# if stats["gradeless_count"] > 0:
+#     st.warning(
+#         f"⚠️ تم استثناء **{stats['gradeless_count']}** طالب لعدم تحديد صفهم. "
+#         f"راجع تبويب **طلاب بدون صف** للتفاصيل."
+#     )
 
 # ══════════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
